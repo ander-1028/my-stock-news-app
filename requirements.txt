@@ -1,0 +1,7 @@
+streamlit
+gnews
+jieba
+scikit-learn
+pandas
+twstock
+lxml

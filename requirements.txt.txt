@@ -1,0 +1,6 @@
+gnews
+streamlit
+pandas
+jieba
+twstock
+scikit-learn
