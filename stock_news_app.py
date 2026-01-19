@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 from gnews import GNews
@@ -7,9 +6,21 @@ import twstock
 from FinMind.data import DataLoader
 import datetime
 import math
+import os
 
 # --- Configuration & Setup ---
 st.set_page_config(page_title="台灣股市新聞分析與市場概況", layout="wide", page_icon="📈")
+
+# Function to safely get secrets
+def get_secret(key):
+    try:
+        # Truly safe access to st.secrets
+        # We don't even check 'if key in st.secrets' as that might trigger it
+        val = st.secrets.get(key)
+        if val: return val
+    except Exception:
+        pass
+    return os.environ.get(key)
 
 # --- Classes ---
 
@@ -53,10 +64,13 @@ class StockMatcher:
 
 class MarketDataFetcher:
     def __init__(self):
-        self.api_token = st.secrets.get("FINMIND_TOKEN", None)
+        self.api_token = get_secret("FINMIND_TOKEN")
         self.dl = DataLoader()
         if self.api_token:
-            self.dl.login_by_token(api_token=self.api_token)
+            try:
+                self.dl.login_by_token(api_token=self.api_token)
+            except Exception as e:
+                st.error(f"FinMind Login 失敗: {e}")
             
     def get_market_summary(self):
         """Get today's institutional investors data summary."""
@@ -69,7 +83,6 @@ class MarketDataFetcher:
             end_date = today.strftime('%Y-%m-%d')
             
             df = self.dl.taiwan_stock_institutional_investors(
-                data_id="taiwan_stock_institutional_investors",
                 start_date=start_date,
                 end_date=end_date
             )
@@ -122,34 +135,37 @@ def main():
     # --- Market Summary Section ---
     if st.session_state.get('show_summary', False):
         st.subheader("🧐 每日市場概況回顧")
-        fetcher = MarketDataFetcher()
-        summary_df, msg = fetcher.get_market_summary()
+        token = get_secret("FINMIND_TOKEN")
         
-        if summary_df is not None:
-            st.caption(f"資料日期: {msg}")
-            
-            # Display metrics
-            cols = st.columns(len(summary_df))
-            for idx, (name, row) in enumerate(summary_df.iterrows()):
-                net = row['net']
-                color = "normal"
-                if net > 0: color = "inverse" # Streamlit metric delta doesn't support color directly comfortably, standard metric used
-                
-                with cols[idx]:
-                    st.metric(
-                        label=name,
-                        value=f"{int(net/1000000):,} M", # Show in Millions
-                        delta=f"{int(net/1000):,} K",
-                        delta_color="normal" # "normal" means green for positive, inverse means red for positive. 
-                        # Usually Buy > Sell is good (Green).
-                    )
+        if not token:
+            st.warning("⚠️ 未偵測到 FINMIND_TOKEN，無法獲取詳細法人數據。")
+            st.info("請於 .streamlit/secrets.toml 中設定 FINMIND_TOKEN='您的密鑰'")
+            if st.button("關閉概況 "):
+                st.session_state.show_summary = False
         else:
-            st.warning(f"無法取得市場數據: {msg}")
-            if not st.secrets.get("FINMIND_TOKEN"):
-                st.error("未偵測到 FINMIND_TOKEN，請檢查 .streamlit/secrets.toml 設定。")
-        
-        if st.button("關閉概況"):
-            st.session_state.show_summary = False
+            fetcher = MarketDataFetcher()
+            summary_df, msg = fetcher.get_market_summary()
+            
+            if summary_df is not None:
+                st.caption(f"資料日期: {msg}")
+                
+                # Display metrics
+                cols = st.columns(len(summary_df.head(4)))
+                for idx, (name, row) in enumerate(summary_df.iterrows()):
+                    if idx >= 4: break
+                    net = row['net']
+                    
+                    with cols[idx]:
+                        st.metric(
+                            label=name,
+                            value=f"{int(net/1000000):,}M",
+                            delta=f"{int(net/1000):,}K"
+                        )
+            else:
+                st.warning(f"無法取得市場數據: {msg}")
+            
+            if st.button("關閉概況"):
+                st.session_state.show_summary = False
         st.divider()
 
     # --- News Fetching & Processing ---
@@ -167,8 +183,19 @@ def main():
     
     if not st.session_state.raw_news:
          with st.spinner("正在載入最新財經新聞..."):
-            google_news = GNews(language='zh-Hant', country='TW', period='24h', max_results=100)
-            st.session_state.raw_news = google_news.get_news('台灣 股市')
+            try:
+                google_news = GNews(language='zh-Hant', country='TW', period='24h', max_results=50)
+                # Retry different queries
+                news = google_news.get_news('台灣 股市')
+                if not news:
+                    news = google_news.get_news('台股')
+                if not news:
+                    news = google_news.get_top_news()
+                
+                st.session_state.raw_news = news if news else []
+            except Exception as e:
+                st.error(f"抓取新聞失敗: {e}")
+                st.session_state.raw_news = []
 
     # Apply Search & Filter
     all_news = st.session_state.raw_news
@@ -202,15 +229,19 @@ def main():
         filtered_news.append(item)
         
     # 2. Smart Filtering (Stock Only)
-    # "自動過濾掉標題中「未偵測到台灣上市櫃公司」的新聞"
     final_news = []
     matcher = st.session_state.matcher
     
     for item in filtered_news:
-        stocks = matcher.extract_stocks(item['title'])
+        # Some items might not have 'title' if GNews structure changes
+        title = item.get('title', '')
+        stocks = matcher.extract_stocks(title)
         if stocks:
             item['related_stocks'] = stocks
             final_news.append(item)
+    
+    # Debug info (only if dev mode or similar, but let's show success message with details)
+    # st.write(f"抓取 {len(all_news)} 則，關鍵字過濾後 {len(filtered_news)} 則，個股識別後 {len(final_news)} 則")
             
     # 3. Sorting
     if sort_order == "時間由新到舊":
