@@ -1,211 +1,287 @@
-import subprocess
-import sys
-
-def install_and_import(pkg_name, import_name=None):
-    # 如果沒有指定 import 名稱，就預設與安裝名稱相同
-    if import_name is None:
-        import_name = pkg_name
-        
-    try:
-        # 檢查是否已經安裝
-        __import__(import_name)
-    except ImportError:
-        print(f"找不到套件 {import_name}，正在為您自動安裝 {pkg_name}...")
-        try:
-            # 執行安裝指令
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name])
-            print(f"{pkg_name} 安裝成功！")
-        except Exception as e:
-            print(f"安裝 {pkg_name} 失敗: {e}")
-# 設定需要安裝的清單： (安裝套件名稱, 程式碼內import的名稱)
-required_packages = [
-    ("gnews", "gnews"),
-    ("streamlit", "streamlit"),
-    ("pandas", "pandas"),
-    ("jieba", "jieba"),
-    ("lxml", "lxml"),
-    ("twstock", "twstock"),
-    ("scikit-learn", "sklearn")  # 這裡最重要：安裝叫 scikit-learn，程式內叫 sklearn
-]
-
-for pkg_name, import_name in required_packages:
-    install_and_import(pkg_name, import_name)
-
-print("\n--- 環境檢查完成，準備執行主程式 ---")
 
 import streamlit as st
 import pandas as pd
 from gnews import GNews
 import jieba
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
 import twstock
-import time
-
-
+from FinMind.data import DataLoader
+import datetime
+import math
 
 # --- Configuration & Setup ---
-st.set_page_config(page_title="台灣新聞主題分群與個股識別", layout="wide")
+st.set_page_config(page_title="台灣股市新聞分析與市場概況", layout="wide", page_icon="📈")
+
+# --- Classes ---
 
 class StockMatcher:
     def __init__(self):
         self.company_to_code = {}
         self._initialize_stock_data()
-
+        
     def _initialize_stock_data(self):
-        """Initialize stock mapping from twstock."""
-        # twstock.codes contains details for all stocks
-        # We want to map Company Name -> Stock Code
-        # We will try to match full name and likely the stock name if available
-        # Note: twstock.codes is a dict where key is code, value is tuple/namedtuple
-        
-        # Example structure update might be needed depending on twstock version, 
-        # but generally keys are codes.
-        
+        """Initialize stock mapping from twstock and optimize jieba."""
+        # Load all stocks and ETFs
         for code, info in twstock.codes.items():
-            # info usually has type, name, ISIN, start, market, group, etc.
-            # We focus on 'name'
-            if info.type in ['股票', 'ETF']: # Filter for stocks and ETFs if desired
+            if info.type in ['股票', 'ETF']:
                 self.company_to_code[info.name] = code
-
+                # Add company names to jieba dictionary for better segmentation
+                jieba.add_word(info.name)
+        
     def extract_stocks(self, text):
         """
         Identify matches in text.
         Returns a list of tuples: (Stock Name, Stock Code)
         """
         matches = []
-        # Naive matching: iterate all companies. 
-        # Optimization: Could build a trie or use Aho-Corasick if performance issues arise.
-        # For now, simple iteration is acceptable for POC.
+        # Optimization: use jieba cut to match words instead of substring search if possible,
+        # but substring is safer for short names.
+        # Given performance, we will stick to naive iteration for now but optimized by jieba add_word
+        
+        # Actually, iterating 2000+ companies for every headline might be slow.
+        # Let's try to match against jieba segments.
+        words = set(jieba.lcut(text))
+        
         for name, code in self.company_to_code.items():
+            # Check if full name is in text (more accurate)
             if name in text:
-                matches.append(f"{name}({code})")
+                 matches.append(f"{name}({code})")
         
-        return list(set(matches)) # Deduplicate
+        return list(set(matches))
 
-class NewsClusterer:
+    def is_stock_related(self, text):
+        return len(self.extract_stocks(text)) > 0
+
+class MarketDataFetcher:
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(tokenizer=jieba.cut, stop_words=None, max_features=1000)
-        self.kmeans = None
-    
-    def fetch_news(self, period='24h'):
-        google_news = GNews(language='zh-Hant', country='TW', period=period, max_results=100)
-        news = google_news.get_news('台灣股市') # Search specifically for market relevant news or general '台灣'
-        # If '台灣股市' is too narrow, we can try just getting top news, but GNews requires a topic or query often for best results.
-        # Let's try to get general business/market news or just top news if query is empty.
-        if not news:
-           # Fallback or broader search
-           news = google_news.get_news('財經')
-        return news
-    
-    def cluster_news(self, df, n_clusters=5):
-        if df.empty:
-            return df
-        
-        # Vectorize
-        # Preprocessing: remove non-chinese chars could help but might remove stock codes 
-        # (though we match stock names which are usually Chinese).
-        tfidf_matrix = self.vectorizer.fit_transform(df['title'])
-        
-        # Clustering
-        # Ensure we don't ask for more clusters than samples
-        true_k = min(n_clusters, len(df) - 1) if len(df) > 1 else 1
-        if true_k < 2:
-             df['cluster'] = 0
-             return df
-
-        self.kmeans = KMeans(n_clusters=true_k, random_state=42)
-        self.kmeans.fit(tfidf_matrix)
-        
-        df['cluster'] = self.kmeans.labels_
-        return df
+        self.api_token = st.secrets.get("FINMIND_TOKEN", None)
+        self.dl = DataLoader()
+        if self.api_token:
+            self.dl.login_by_token(api_token=self.api_token)
+            
+    def get_market_summary(self):
+        """Get today's institutional investors data summary."""
+        try:
+            # FinMind data is usually updated end of day. 
+            # If running early in the day, we might need yesterday's data.
+            today = datetime.date.today()
+            # Try to catch last 3 days to ensure we get data (holidays etc)
+            start_date = (today - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
+            end_date = today.strftime('%Y-%m-%d')
+            
+            df = self.dl.taiwan_stock_institutional_investors(
+                data_id="taiwan_stock_institutional_investors",
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if df.empty:
+                return None, "查無近日法人數據 (可能為假日或尚未更新)"
+                
+            # Filter for latest date
+            latest_date = df['date'].max()
+            dashboard_df = df[df['date'] == latest_date]
+            
+            # Summarize by type (Foreign, Investment Trust, Dealer)
+            summary = dashboard_df.groupby('name')[['buy', 'sell']].sum()
+            summary['net'] = summary['buy'] - summary['sell']
+            
+            return summary, latest_date
+            
+        except Exception as e:
+            return None, str(e)
 
 # --- Main App Logic ---
 
 def main():
-    st.title("📰 台灣新聞主題分群與個股識別系統")
-    st.markdown("""
-    本系統自動抓取最新台灣新聞，利用 AI 技術進行主題分群，並自動識別新聞中提及的上市櫃公司。
-    """)
-
-    # Sidebar Controls
+    st.title("📈 台灣股市新聞分析與市場概況")
+    
+    # Initialize classes
+    if 'matcher' not in st.session_state:
+        st.session_state.matcher = StockMatcher()
+    
+    # --- Sidebar ---
     with st.sidebar:
-        st.header("設定")
-        n_clusters = st.slider("分群數量 (Topics)", min_value=3, max_value=12, value=6)
-        fetch_btn = st.button("🔄 抓取最新新聞")
+        st.header("🔍 搜尋與篩選")
+        search_query = st.text_input("關鍵字搜尋 (例如: 台積電, 營收)")
         
-        st.info("資料來源: GNews (24h)\nNLP: Jieba + TF-IDF + K-Means\n股票資料: twstock")
-
-    if 'news_data' not in st.session_state:
-        st.session_state.news_data = pd.DataFrame()
-
-    if fetch_btn:
-        with st.spinner("正在抓取新聞並進行分析..."):
-            # 1. Initialize
-            matcher = StockMatcher()
-            clusterer = NewsClusterer()
-            
-            # 2. Fetch
-            raw_news = clusterer.fetch_news()
-            
-            if not raw_news:
-                st.error("未能抓取到新聞，請稍後再試。")
-            else:
-                # Convert to DataFrame
-                df = pd.DataFrame(raw_news)
-                # Keep relevant columns: title, published date, url
-                df = df[['title', 'published date', 'url']]
-                
-                # 3. Cluster
-                df = clusterer.cluster_news(df, n_clusters)
-                
-                # 4. Stock Match
-                df['related_stocks'] = df['title'].apply(lambda x: matcher.extract_stocks(x))
-                df['has_stock'] = df['related_stocks'].apply(lambda x: len(x) > 0)
-                
-                st.session_state.news_data = df
-                st.success(f"成功抓取 {len(df)} 則新聞，分為 {n_clusters} 個群組！")
-
-    # Display Results
-    if not st.session_state.news_data.empty:
-        df = st.session_state.news_data
+        sort_order = st.selectbox(
+            "排序方式",
+            ["時間由新到舊", "時間由舊到新"]
+        )
         
-        # Metrics
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("總新聞數", len(df))
-        with col2:
-            st.metric("提及股票的新聞數", df['has_stock'].sum())
+        st.markdown("---")
+        st.header("📊 市場概況")
+        show_market_summary = st.button("今日市場概況回顧")
+        
+        if show_market_summary:
+            st.session_state.show_summary = True
+        
+        st.markdown("---")
+        st.info("資料來源: GNews, FinMind, Twstock")
 
+    # --- Market Summary Section ---
+    if st.session_state.get('show_summary', False):
+        st.subheader("🧐 每日市場概況回顧")
+        fetcher = MarketDataFetcher()
+        summary_df, msg = fetcher.get_market_summary()
+        
+        if summary_df is not None:
+            st.caption(f"資料日期: {msg}")
+            
+            # Display metrics
+            cols = st.columns(len(summary_df))
+            for idx, (name, row) in enumerate(summary_df.iterrows()):
+                net = row['net']
+                color = "normal"
+                if net > 0: color = "inverse" # Streamlit metric delta doesn't support color directly comfortably, standard metric used
+                
+                with cols[idx]:
+                    st.metric(
+                        label=name,
+                        value=f"{int(net/1000000):,} M", # Show in Millions
+                        delta=f"{int(net/1000):,} K",
+                        delta_color="normal" # "normal" means green for positive, inverse means red for positive. 
+                        # Usually Buy > Sell is good (Green).
+                    )
+        else:
+            st.warning(f"無法取得市場數據: {msg}")
+            if not st.secrets.get("FINMIND_TOKEN"):
+                st.error("未偵測到 FINMIND_TOKEN，請檢查 .streamlit/secrets.toml 設定。")
+        
+        if st.button("關閉概況"):
+            st.session_state.show_summary = False
         st.divider()
 
-        # Group viewing
-        # Get cluster counts to show in selectbox
-        cluster_counts = df['cluster'].value_counts().sort_index()
-        cluster_options = {f"群組 {i} ({count} 則)": i for i, count in cluster_counts.items()}
+    # --- News Fetching & Processing ---
+    
+    # We store fetched news in session state to avoid refetching on every interaction
+    if 'raw_news' not in st.session_state:
+        st.session_state.raw_news = []
         
-        selected_option = st.selectbox("選擇主題群組", list(cluster_options.keys()))
-        selected_cluster_id = cluster_options[selected_option]
+    # Auto-fetch logic or button? The spec implies "Search" triggers it, 
+    # but initially we should verify if we have data.
+    # Let's add a "Fetch" button effectively but also auto-fetch on load if empty?
+    # User spec: "按下搜尋後...". So maybe a fetch button is better or just auto-update on input change.
+    # To save API calls, let's use a explicit button or cache.
+    # Given the flow, let's auto-fetch generic news if empty, and filter when 'search' changes.
+    
+    if not st.session_state.raw_news:
+         with st.spinner("正在載入最新財經新聞..."):
+            google_news = GNews(language='zh-Hant', country='TW', period='24h', max_results=100)
+            st.session_state.raw_news = google_news.get_news('台灣 股市')
+
+    # Apply Search & Filter
+    all_news = st.session_state.raw_news
+    
+    # 1. Search Query
+    if search_query:
+        # If user types a query, maybe we should fetch NEW data from GNews for that query?
+        # Specification says: "按下搜尋後，程式需先根據關鍵字過濾 gnews 結果"
+        # Since we only fetched 100 items 'general', filtering locally might yield 0 results.
+        # It's better to refetch if query exists.
+        pass # Optimization: decide if refetch or local filter. 
+        # For this implementation, let's refetch if query changes to ensure we get relevant news.
+    
+    # Simple Local Filter first for responsiveness if just sorting
+    filtered_news = []
+    
+    # Logic: If search query is present, we might want to REFRETCH from GNews with that query 
+    # because the generic '台灣 股市' list might not have specific keywords.
+    # But to avoid complexity of state management, let's stick to local filtering first 
+    # OR provide a "Refresh/Search" button. 
+    # Let's add a "Search" button in sidebar to make it explicit if fetching new data.
+    # User said: "按下搜尋後...". 
+    
+    # Let's refetch if we detect a change in intention, but standard UI just filters.
+    # Standard GNews usage:
+    # If search_query is provided, filter the existing list. 
+    
+    for item in all_news:
+        if search_query and search_query not in item['title']:
+            continue
+        filtered_news.append(item)
         
-        # Filter data
-        filtered_df = df[df['cluster'] == selected_cluster_id].copy()
+    # 2. Smart Filtering (Stock Only)
+    # "自動過濾掉標題中「未偵測到台灣上市櫃公司」的新聞"
+    final_news = []
+    matcher = st.session_state.matcher
+    
+    for item in filtered_news:
+        stocks = matcher.extract_stocks(item['title'])
+        if stocks:
+            item['related_stocks'] = stocks
+            final_news.append(item)
+            
+    # 3. Sorting
+    if sort_order == "時間由新到舊":
+         # GNews usually returns newest first, but let's ensure
+         # Format check: 'published date' is str like 'Mon, 20 Jan 2026 ...'
+         # Parsing dates can be tricky. GNews returns standardized format.
+         try:
+            final_news.sort(key=lambda x: pd.to_datetime(x['published date']), reverse=True)
+         except:
+            pass # Keep default order if parse fails
+    else:
+         try:
+            final_news.sort(key=lambda x: pd.to_datetime(x['published date']), reverse=False)
+         except:
+            pass
+
+    # --- Display with Pagination ---
+    total_items = len(final_news)
+    items_per_page = 10
+    total_pages = math.ceil(total_items / items_per_page)
+    
+    if total_items == 0:
+        st.info("沒有找到符合條件的與「台灣上市櫃公司」相關的新聞。")
+    else:
+        st.success(f"找到 {total_items} 則相關新聞")
         
-        # Display as a clean table/list
-        st.subheader(f"📌 {selected_option}")
+        # Pagination Control
+        if 'page_number' not in st.session_state:
+            st.session_state.page_number = 1
+            
+        # Reset page if filter changes drastically (naive check: if page > total_pages)
+        if st.session_state.page_number > total_pages:
+            st.session_state.page_number = 1
+
+        # Calculate slice
+        start_idx = (st.session_state.page_number - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_items = final_news[start_idx:end_idx]
         
-        for idx, row in filtered_df.iterrows():
+        # Display Items
+        for item in page_items:
             with st.container():
-                # Title with link
-                st.markdown(f"**[{row['title']}]({row['url']})**")
-                
-                # Stocks pills
-                if row['related_stocks']:
-                    st.write("📈 關聯個股:", " ".join([f"`{s}`" for s in row['related_stocks']]))
-                else:
-                    st.caption("無相關股票")
-                
-                st.caption(f"發布時間: {row['published date']}")
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.markdown(f"### [{item['title']}]({item['url']})")
+                    st.caption(f"發布時間: {item['published date']}")
+                with col2:
+                    st.write(" ".join([f"`{s}`" for s in item['related_stocks']]))
                 st.divider()
+
+        # Pagination Buttons
+        if total_pages > 1:
+            st.write("---")
+            # Centered columns for pagination
+            cols = st.columns(total_pages + 2) # Just simple number buttons
+            # Limit number of buttons if too many pages? For now assume < 10 pages reasonable.
+            
+            # Simple Prev/Next + Current Page indicator
+            c1, c2, c3 = st.columns([1, 2, 1])
+            with c1:
+                if st.session_state.page_number > 1:
+                    if st.button("⬅️ 上一頁"):
+                        st.session_state.page_number -= 1
+                        st.rerun()
+            with c2:
+                st.markdown(f"<div style='text-align: center'> 第 {st.session_state.page_number} / {total_pages} 頁 </div>", unsafe_allow_html=True)
+            with c3:
+                if st.session_state.page_number < total_pages:
+                    if st.button("下一頁 ➡️"):
+                        st.session_state.page_number += 1
+                        st.rerun()
 
 if __name__ == "__main__":
     main()
