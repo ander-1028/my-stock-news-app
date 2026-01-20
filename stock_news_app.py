@@ -7,6 +7,7 @@ from FinMind.data import DataLoader
 import datetime
 import math
 import os
+import yfinance as yf
 
 # --- Configuration & Setup ---
 st.set_page_config(page_title="台灣股市新聞分析與市場概況", layout="wide", page_icon="📈")
@@ -103,6 +104,43 @@ class MarketDataFetcher:
         except Exception as e:
             return None, str(e)
 
+class MarketQuoteFetcher:
+    def __init__(self):
+        self.symbols = {
+            "^TWII": "台股大盤",
+            "2330.TW": "台積電",
+            "2454.TW": "聯發科",
+            "AAPL": "蘋果 (AAPL)",
+            "NVDA": "輝達 (NVDA)"
+        }
+
+    def fetch_quotes(self):
+        data = []
+        try:
+            for symbol, name in self.symbols.items():
+                ticker = yf.Ticker(symbol)
+                # Use fast_info or history if info is slow
+                hist = ticker.history(period="2d")
+                if not hist.empty:
+                    current_price = hist['Close'].iloc[-1]
+                    prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+                    change = current_price - prev_close
+                    pct_change = (change / prev_close) * 100 if prev_close != 0 else 0
+                    
+                    data.append({
+                        "股票名稱": name,
+                        "代碼": symbol,
+                        "最新價格": round(current_price, 2),
+                        "漲跌金額": round(change, 2),
+                        "漲跌幅 (%)": f"{pct_change:+.2f}%"
+                    })
+                else:
+                    data.append({"股票名稱": name, "代碼": symbol, "最新價格": "無數據", "漲跌金額": "-", "漲跌幅 (%)": "-"})
+            return pd.DataFrame(data)
+        except Exception as e:
+            st.error(f"行情抓取失敗: {e}")
+            return pd.DataFrame()
+
 # --- Main App Logic ---
 
 def main():
@@ -123,14 +161,47 @@ def main():
         )
         
         st.markdown("---")
-        st.header("📊 市場概況")
-        show_market_summary = st.button("今日市場概況回顧")
-        
-        if show_market_summary:
+        st.header("🌙 市場概況")
+        if st.button("今日市場概況回顧"):
             st.session_state.show_summary = True
-        
+            
+        st.header("📈 即時行情")
+        if st.button("🚀 顯示今日最新行情"):
+            st.session_state.show_quotes = True
+
         st.markdown("---")
-        st.info("資料來源: GNews, FinMind, Twstock")
+        st.info("資料來源: GNews, FinMind, Twstock, yfinance")
+
+    # --- Market Quotes Section ---
+    if st.session_state.get('show_quotes', False):
+        st.subheader("🚀 今日最新熱門股票行情")
+        with st.spinner("正在獲取最新即時數據..."):
+            quote_fetcher = MarketQuoteFetcher()
+            quotes_df = quote_fetcher.fetch_quotes()
+            
+            if not quotes_df.empty:
+                # Top metrics for indices/big stocks
+                m1, m2, m3 = st.columns(3)
+                # Show Index, TSMC, NVDA as highlights
+                def get_row(df, sym): return df[df['代碼'] == sym].iloc[0] if sym in df['代碼'].values else None
+                
+                idx_row = get_row(quotes_df, "^TWII")
+                tsmc_row = get_row(quotes_df, "2330.TW")
+                nvda_row = get_row(quotes_df, "NVDA")
+                
+                if idx_row is not None:
+                    m1.metric(idx_row['股票名稱'], f"{idx_row['最新價格']:,}", idx_row['漲跌幅 (%)'])
+                if tsmc_row is not None:
+                    m2.metric(tsmc_row['股票名稱'], f"{tsmc_row['最新價格']:,}", tsmc_row['漲跌幅 (%)'])
+                if nvda_row is not None:
+                    m3.metric(nvda_row['股票名稱'], f"{nvda_row['最新價格']:,}", nvda_row['漲跌幅 (%)'])
+                
+                st.write("")
+                st.dataframe(quotes_df, use_container_width=True, hide_index=True)
+            
+            if st.button("關閉行情"):
+                st.session_state.show_quotes = False
+        st.divider()
 
     # --- Market Summary Section ---
     if st.session_state.get('show_summary', False):
