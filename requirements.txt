@@ -7,3 +7,4 @@ twstock
 lxml
 FinMind
 yfinance
+tqdm
