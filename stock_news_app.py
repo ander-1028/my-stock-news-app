@@ -5,9 +5,57 @@ import jieba
 import twstock
 from FinMind.data import DataLoader
 import datetime
-import math
 import os
+import re
 import yfinance as yf
+import math
+import json
+
+# --- Constants & Mapping ---
+# Sources for financial news to ensure quality
+FINANCIAL_SOURCES = "(工商時報 OR 經濟日報 OR 科技新報 OR 鉅亨網 OR 數位時代)"
+
+DEFAULT_INDUSTRY_MAP = {
+    "AI 與 伺服器": [
+        ("台積電", "2330"), ("鴻海", "2317"), ("廣達", "2382"), ("緯創", "3231"), 
+        ("技嘉", "2376"), ("勤誠", "2359"), ("川湖", "2059"), ("雙鴻", "3324"), ("奇鋐", "3017")
+    ],
+    "半導體": [
+        ("台積電", "2330"), ("聯電", "2303"), ("聯發科", "2454"), ("日月光投控", "3711"), 
+        ("世芯-KY", "3661"), ("創意", "3443"), ("京元電子", "2449")
+    ],
+    "軍工與航太": [
+        ("漢翔", "2634"), ("龍德造船", "6753"), ("雷虎", "8033"), ("全訊", "5222"), 
+        ("中信造船", "2644"), ("寶一", "8222"), ("亞航", "2630")
+    ],
+    "低軌衛星": [
+        ("昇達科", "3491"), ("啟碁", "6285"), ("金像電", "2368"), ("耀華", "2367"), 
+        ("華通", "2313"), ("台揚", "2314"), ("貿聯-KY", "3665")
+    ],
+    "監控清單": []
+}
+
+MAP_FILE = "my_industry_map.json"
+
+def load_industry_map():
+    """Load industry map from JSON if exists, otherwise return default."""
+    if os.path.exists(MAP_FILE):
+        try:
+            with open(MAP_FILE, "r", encoding="utf-8") as f:
+                saved_map = json.load(f)
+                # Convert list [name, code] back to tuple (name, code)
+                return {k: [tuple(v) for v in val] for k, val in saved_map.items()}
+        except Exception as e:
+            st.error(f"預讀清單發生錯誤: {e}")
+    return DEFAULT_INDUSTRY_MAP.copy()
+
+def save_industry_map(industry_map):
+    """Save industry map to JSON."""
+    try:
+        with open(MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump(industry_map, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        st.error(f"儲存清單發生錯誤: {e}")
 
 # --- Configuration & Setup ---
 st.set_page_config(page_title="台灣股市新聞分析與市場概況", layout="wide", page_icon="📈")
@@ -15,13 +63,87 @@ st.set_page_config(page_title="台灣股市新聞分析與市場概況", layout=
 # Function to safely get secrets
 def get_secret(key):
     try:
-        # Truly safe access to st.secrets
-        # We don't even check 'if key in st.secrets' as that might trigger it
         val = st.secrets.get(key)
         if val: return val
     except Exception:
         pass
     return os.environ.get(key)
+
+# --- Cached Fetching Functions ---
+
+@st.cache_data(ttl=3600)
+def fetch_institutional_data_cached(api_token, start_date, end_date):
+    """Cached function to fetch FinMind data."""
+    dl = DataLoader()
+    if api_token:
+        try:
+            dl.login_by_token(api_token=api_token)
+            df = dl.taiwan_stock_institutional_investors(
+                start_date=start_date,
+                end_date=end_date
+            )
+            return df
+        except Exception as e:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def fetch_market_quotes_cached(symbols_tuple):
+    """Cached function to fetch yfinance data."""
+    data = []
+    for symbol in symbols_tuple:
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="2d")
+            if not hist.empty:
+                current_price = hist['Close'].iloc[-1]
+                prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+                change = current_price - prev_close
+                pct_change = (change / prev_close) * 100 if prev_close != 0 else 0
+                data.append({
+                    "代碼": symbol,
+                    "最新價格": round(current_price, 2),
+                    "漲跌金額": round(change, 2),
+                    "漲跌幅 (%)": f"{pct_change:+.2f}%"
+                })
+        except Exception:
+            continue
+    return pd.DataFrame(data)
+
+@st.cache_data(ttl=600)
+def fetch_news_data_cached(query=None):
+    """Cached function to fetch GNews data with maximum transparency."""
+    try:
+        # Use explicit TW and zh-Hant settings
+        google_news = GNews(language='zh-Hant', country='TW', period='24h', max_results=50)
+        
+        if query:
+            # Strictly use user input without modification
+            news = google_news.get_news(query)
+        else:
+            # Default fallback news
+            news = google_news.get_news('台灣 股市')
+            
+        return news if news else []
+    except Exception as e:
+        st.error(f"GNews 抓取發生錯誤: {e}")
+        return []
+
+@st.cache_data(ttl=600)
+def get_stock_price_cached(code):
+    """Quickly fetch stock price for concept stocks."""
+    try:
+        symbol = f"{code}.TW"
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="2d")
+        if not hist.empty:
+            curr = hist['Close'].iloc[-1]
+            prev = hist['Close'].iloc[-2] if len(hist) > 1 else curr
+            change_pct = ((curr - prev) / prev) * 100 if prev != 0 else 0
+            return curr, change_pct
+    except:
+        pass
+    return None, None
 
 # --- Classes ---
 
@@ -66,47 +188,49 @@ class StockMatcher:
 class MarketDataFetcher:
     def __init__(self):
         self.api_token = get_secret("FINMIND_TOKEN")
-        self.dl = DataLoader()
-        if self.api_token:
-            try:
-                self.dl.login_by_token(api_token=self.api_token)
-            except Exception as e:
-                st.error(f"FinMind Login 失敗: {e}")
             
     def get_market_summary(self):
-        """Get today's institutional investors data summary."""
+        """Get today's institutional investors data summary using cached fetch."""
         try:
-            # FinMind data is usually updated end of day. 
-            # If running early in the day, we might need yesterday's data.
             today = datetime.date.today()
-            # Try to catch last 3 days to ensure we get data (holidays etc)
             start_date = (today - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
             end_date = today.strftime('%Y-%m-%d')
             
-            df = self.dl.taiwan_stock_institutional_investors(
-                start_date=start_date,
-                end_date=end_date
-            )
+            df = fetch_institutional_data_cached(self.api_token, start_date, end_date)
             
             if df.empty:
-                return None, "查無近日法人數據 (可能為假日或尚未更新)"
+                return None, "查無近日法人數據 (或 API 錯誤)"
                 
-            # Filter for latest date
             latest_date = df['date'].max()
             dashboard_df = df[df['date'] == latest_date]
-            
-            # Summarize by type (Foreign, Investment Trust, Dealer)
             summary = dashboard_df.groupby('name')[['buy', 'sell']].sum()
             summary['net'] = summary['buy'] - summary['sell']
             
             return summary, latest_date
-            
         except Exception as e:
             return None, str(e)
 
+def get_industry_info(text, industry_map):
+    """Detect industry from text and return associated stocks."""
+    keywords = {
+        "AI 與 伺服器": ["伺服器", "AI", "Server", "輝達", "NVIDIA", "運算"],
+        "半導體": ["半導體", "晶圓", "台積電", "IC", "晶片", "Semiconductor"],
+        "軍工與航太": ["軍工", "航太", "飛機", "國防", "造船", "雷虎"],
+        "低軌衛星": ["低軌衛星", "低軌", "衛星", "SpaceX", "Starlink"]
+    }
+    for industry, keys in keywords.items():
+        if any(k.lower() in text.lower() for k in keys):
+            return industry, industry_map.get(industry, [])
+    return None, None
+
+def detect_supply_chain_action(text):
+    """Detect supply chain actions in text."""
+    actions = ["打入", "切入", "供應", "獲訂單", "供應鏈", "進軍", "合作"]
+    return any(a in text for a in actions)
+
 class MarketQuoteFetcher:
     def __init__(self):
-        self.symbols = {
+        self.symbols_map = {
             "^TWII": "台股大盤",
             "2330.TW": "台積電",
             "AAPL": "蘋果 (AAPL)",
@@ -114,40 +238,57 @@ class MarketQuoteFetcher:
         }
 
     def fetch_quotes(self):
-        data = []
         try:
-            for symbol, name in self.symbols.items():
-                ticker = yf.Ticker(symbol)
-                # Use fast_info or history if info is slow
-                hist = ticker.history(period="2d")
-                if not hist.empty:
-                    current_price = hist['Close'].iloc[-1]
-                    prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
-                    change = current_price - prev_close
-                    pct_change = (change / prev_close) * 100 if prev_close != 0 else 0
-                    
-                    data.append({
-                        "股票名稱": name,
-                        "代碼": symbol,
-                        "最新價格": round(current_price, 2),
-                        "漲跌金額": round(change, 2),
-                        "漲跌幅 (%)": f"{pct_change:+.2f}%"
-                    })
-                else:
-                    data.append({"股票名稱": name, "代碼": symbol, "最新價格": "無數據", "漲跌金額": "-", "漲跌幅 (%)": "-"})
-            return pd.DataFrame(data)
+            symbols_tuple = tuple(self.symbols_map.keys())
+            df = fetch_market_quotes_cached(symbols_tuple)
+            
+            if not df.empty:
+                # Add human readable names back to the cached dataframe
+                df['股票名稱'] = df['代碼'].map(self.symbols_map)
+                # Reorder columns
+                cols = ["股票名稱", "代碼", "最新價格", "漲跌金額", "漲跌幅 (%)"]
+                return df[cols]
+            return df
         except Exception as e:
-            st.error(f"行情抓取失敗: {e}")
+            st.error(f"行情處理失敗: {e}")
             return pd.DataFrame()
 
 # --- Main App Logic ---
 
+def intelligent_extract_company(title):
+    """
+    Intelligently extract company name and code from title.
+    Rules:
+    1. Text inside brackets (e.g. "台積電").
+    2. Nouns before action verbs like "打入", "供貨", "供應".
+    """
+    # 1. Brackets check
+    bracket_match = re.search(r'[(（]([^)）0-9]{2,6})[)）]', title)
+    if bracket_match:
+        return bracket_match.group(1), ""
+    
+    # 2. Action verb check
+    for verb in ["打入", "供貨", "供應", "供應鏈", "切入"]:
+        if verb in title:
+            # Simple take first 2-4 chars before verb as company name
+            idx = title.find(verb)
+            if idx > 2:
+                name = title[max(0, idx-3):idx].strip()
+                # Clean up punctuation
+                name = re.sub(r'[^\w\s]', '', name)
+                return name, ""
+                
+    return "", ""
+
 def main():
     st.title("📈 台灣股市新聞分析與市場概況")
     
-    # Initialize classes
+    # Initialize classes & session state
     if 'matcher' not in st.session_state:
         st.session_state.matcher = StockMatcher()
+    
+    if 'industry_map' not in st.session_state:
+        st.session_state.industry_map = load_industry_map()
     
     # --- Sidebar ---
     with st.sidebar:
@@ -161,6 +302,20 @@ def main():
         
         if st.button("🚀 顯示今日最新概況"):
             st.session_state.show_quotes = True
+            st.session_state.industry_active = False
+
+        st.markdown("---")
+        st.header("🚀 產業即時趨勢")
+        selected_industry = st.selectbox(
+            "選擇關注產業", 
+            ["請選擇..."] + list(st.session_state.industry_map.keys()),
+            key="sidebar_ind_sel"
+        )
+        if selected_industry != "請選擇...":
+            st.session_state.industry_active = True
+            st.session_state.selected_industry = selected_industry
+            st.session_state.show_quotes = False
+            st.session_state.show_summary = False
             
         st.markdown("---")
         st.header("🌙 法人數據")
@@ -199,6 +354,51 @@ def main():
             
             if st.button("關閉行情"):
                 st.session_state.show_quotes = False
+        st.divider()
+
+    # --- Industry Analysis Section ---
+    if st.session_state.get('industry_active', False):
+        industry = st.session_state.get('selected_industry', "AI 與 伺服器")
+        st.subheader(f"🚀 {industry} - 產業趨勢分析")
+        
+        # Display Concept Stocks List
+        concept_stocks = st.session_state.industry_map.get(industry, [])
+        st.info(f"💡 **{industry} 概念股清單：** " + "、".join([f"{name}({code})" for name, code in concept_stocks]))
+        
+        # Quick price check columns
+        price_cols = st.columns(min(len(concept_stocks), 5))
+        for i, (name, code) in enumerate(concept_stocks[:5]): # Show first 5 in metrics
+            with price_cols[i % 5]:
+                price, pct = get_stock_price_cached(code)
+                if price:
+                    st.metric(name, f"{price:.1f}", f"{pct:+.2f}%")
+        
+        # Fetch industry specific news
+        with st.spinner(f"正在抓取 {industry} 相關高品質財經新聞..."):
+            industry_news = fetch_news_data_cached(industry)
+            
+            if industry_news:
+                for item in industry_news[:5]: # Show top 5
+                    with st.expander(f"📌 {item.get('title', '無標題')}"):
+                        st.write(item.get('description', '內容載入中...'))
+                        st.markdown(f"[閱讀全文]({item.get('url')})")
+                
+                # Full list with clickable price check
+                st.write("**🔍 即時股價連動 (點擊個股查詢):**")
+                p_cols = st.columns(min(len(concept_stocks), 4))
+                for i, (name, code) in enumerate(concept_stocks):
+                    with p_cols[i % 4]:
+                        if st.button(f"💵 {name} ({code})", key=f"btn_{code}"):
+                            p, c = get_stock_price_cached(code)
+                            if p:
+                                st.write(f"💰 {p:.1f} ({c:+.2f}%)")
+                            else:
+                                st.write("查無股價")
+            else:
+                st.warning("目前無相關重大產業新聞。")
+        
+        if st.button("結束產業分析"):
+            st.session_state.industry_active = False
         st.divider()
 
     # --- Market Summary Section ---
@@ -240,90 +440,50 @@ def main():
     # --- News Fetching & Processing ---
     
     # We store fetched news in session state to avoid refetching on every interaction
-    if 'raw_news' not in st.session_state:
-        st.session_state.raw_news = []
-        
-    # Auto-fetch logic or button? The spec implies "Search" triggers it, 
-    # but initially we should verify if we have data.
-    # Let's add a "Fetch" button effectively but also auto-fetch on load if empty?
-    # User spec: "按下搜尋後...". So maybe a fetch button is better or just auto-update on input change.
-    # To save API calls, let's use a explicit button or cache.
-    # Given the flow, let's auto-fetch generic news if empty, and filter when 'search' changes.
+    # except when the search query changes.
+    if 'last_query' not in st.session_state:
+        st.session_state.last_query = ""
     
-    if not st.session_state.raw_news:
-         with st.spinner("正在載入最新財經新聞..."):
-            try:
-                google_news = GNews(language='zh-Hant', country='TW', period='24h', max_results=50)
-                # Retry different queries
-                news = google_news.get_news('台灣 股市')
-                if not news:
-                    news = google_news.get_news('台股')
-                if not news:
-                    news = google_news.get_top_news()
-                
-                st.session_state.raw_news = news if news else []
-            except Exception as e:
-                st.error(f"抓取新聞失敗: {e}")
-                st.session_state.raw_news = []
+    # Trigger fetch if first run or query changed
+    should_fetch = False
+    if 'raw_news' not in st.session_state or not st.session_state.raw_news:
+        should_fetch = True
+    if search_query != st.session_state.last_query:
+        should_fetch = True
+        st.session_state.last_query = search_query
 
-    # Apply Search & Filter
+    if should_fetch:
+        with st.spinner("正在搜尋新聞..."):
+            # Strictly direct query
+            st.session_state.raw_news = fetch_news_data_cached(search_query if search_query else None)
+            st.session_state.page_number = 1 
+
     all_news = st.session_state.raw_news
     
-    # 1. Search Query
-    if search_query:
-        # If user types a query, maybe we should fetch NEW data from GNews for that query?
-        # Specification says: "按下搜尋後，程式需先根據關鍵字過濾 gnews 結果"
-        # Since we only fetched 100 items 'general', filtering locally might yield 0 results.
-        # It's better to refetch if query exists.
-        pass # Optimization: decide if refetch or local filter. 
-        # For this implementation, let's refetch if query changes to ensure we get relevant news.
-    
-    # Simple Local Filter first for responsiveness if just sorting
-    filtered_news = []
-    
-    # Logic: If search query is present, we might want to REFRETCH from GNews with that query 
-    # because the generic '台灣 股市' list might not have specific keywords.
-    # But to avoid complexity of state management, let's stick to local filtering first 
-    # OR provide a "Refresh/Search" button. 
-    # Let's add a "Search" button in sidebar to make it explicit if fetching new data.
-    # User said: "按下搜尋後...". 
-    
-    # Let's refetch if we detect a change in intention, but standard UI just filters.
-    # Standard GNews usage:
-    # If search_query is provided, filter the existing list. 
-    
-    for item in all_news:
-        if search_query and search_query not in item['title']:
-            continue
-        filtered_news.append(item)
-        
-    # 2. Smart Filtering (Stock Only)
+    # Debug section disabled per user request
+    if not all_news:
+        st.info("請嘗試更換關鍵字，目前查無資料")
+        return 
+
+    # No strict filtering by stock ID - show all but identify stocks for labeling
     final_news = []
     matcher = st.session_state.matcher
     
-    for item in filtered_news:
-        # Some items might not have 'title' if GNews structure changes
+    for item in all_news:
         title = item.get('title', '')
-        stocks = matcher.extract_stocks(title)
-        if stocks:
-            item['related_stocks'] = stocks
-            final_news.append(item)
-    
-    # Debug info (only if dev mode or similar, but let's show success message with details)
-    # st.write(f"抓取 {len(all_news)} 則，關鍵字過濾後 {len(filtered_news)} 則，個股識別後 {len(final_news)} 則")
+        # Only label, don't filter
+        item['related_stocks'] = matcher.extract_stocks(title)
+        final_news.append(item)
             
-    # 3. Sorting
+    # --- Sorting ---
     if sort_order == "時間由新到舊":
-         # GNews usually returns newest first, but let's ensure
-         # Format check: 'published date' is str like 'Mon, 20 Jan 2026 ...'
-         # Parsing dates can be tricky. GNews returns standardized format.
          try:
-            final_news.sort(key=lambda x: pd.to_datetime(x['published date']), reverse=True)
+            final_news.sort(key=lambda x: pd.to_datetime(x.get('published date', '2000-01-01')), reverse=True)
          except:
-            pass # Keep default order if parse fails
+            pass
     else:
          try:
-            final_news.sort(key=lambda x: pd.to_datetime(x['published date']), reverse=False)
+            final_news.sort(key=lambda x: pd.to_datetime(x.get('published date', '2000-01-01')), reverse=False)
          except:
             pass
 
@@ -332,56 +492,125 @@ def main():
     items_per_page = 10
     total_pages = math.ceil(total_items / items_per_page)
     
-    if total_items == 0:
-        st.info("沒有找到符合條件的與「台灣上市櫃公司」相關的新聞。")
-    else:
-        st.success(f"找到 {total_items} 則相關新聞")
+    st.success(f"找到 {total_items} 則相關新聞")
         
-        # Pagination Control
-        if 'page_number' not in st.session_state:
-            st.session_state.page_number = 1
+    # Pagination Control
+    if 'page_number' not in st.session_state:
+        st.session_state.page_number = 1
             
-        # Reset page if filter changes drastically (naive check: if page > total_pages)
-        if st.session_state.page_number > total_pages:
-            st.session_state.page_number = 1
+    if st.session_state.page_number > total_pages:
+        st.session_state.page_number = 1
 
-        # Calculate slice
-        start_idx = (st.session_state.page_number - 1) * items_per_page
-        end_idx = start_idx + items_per_page
-        page_items = final_news[start_idx:end_idx]
-        
-        # Display Items
-        for item in page_items:
-            with st.container():
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.markdown(f"### [{item['title']}]({item['url']})")
-                    st.caption(f"發布時間: {item['published date']}")
-                with col2:
+    start_idx = (st.session_state.page_number - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_items = final_news[start_idx:end_idx]
+    
+    # Display Items
+    for item in page_items:
+        with st.container(border=True): # Use border for clarity
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"### [{item['title']}]({item['url']})")
+                st.caption(f"發布時間: {item.get('published date', '未知')}")
+            with col2:
+                if item.get('related_stocks'):
                     st.write(" ".join([f"`{s}`" for s in item['related_stocks']]))
-                st.divider()
-
-        # Pagination Buttons
-        if total_pages > 1:
-            st.write("---")
-            # Centered columns for pagination
-            cols = st.columns(total_pages + 2) # Just simple number buttons
-            # Limit number of buttons if too many pages? For now assume < 10 pages reasonable.
+                else:
+                    st.info("無標註個股")
             
-            # Simple Prev/Next + Current Page indicator
-            c1, c2, c3 = st.columns([1, 2, 1])
-            with c1:
-                if st.session_state.page_number > 1:
-                    if st.button("⬅️ 上一頁"):
-                        st.session_state.page_number -= 1
-                        st.rerun()
-            with c2:
-                st.markdown(f"<div style='text-align: center'> 第 {st.session_state.page_number} / {total_pages} 頁 </div>", unsafe_allow_html=True)
-            with c3:
-                if st.session_state.page_number < total_pages:
-                    if st.button("下一頁 ➡️"):
-                        st.session_state.page_number += 1
-                        st.rerun()
+            # Industry smart detection
+            ind_name, ind_stocks = get_industry_info(item['title'] + item.get('description', ''), st.session_state.industry_map)
+            if ind_name:
+                st.info(f"✨ **{ind_name} 供應鏈追蹤：** " + "、".join([f"{n}({c})" for n, c in ind_stocks]))
+            
+            # Explicit Action Trigger - Logic for displaying button
+            has_action = detect_supply_chain_action(item['title'])
+            is_target_keyword = any(k in item['title'].lower() for k in ["spacex", "伺服器", "server"])
+            
+            if has_action or is_target_keyword:
+                with st.success("🚀 **發現潛在產業機會！** 是否要將此公司加入您的追蹤清單？", icon="🔗"):
+                    # Initialization of toggle state for each news item
+                    btn_key = f"sc_btn_{item.get('url')}"
+                    if st.button("🛠️ 展開更新工具", key=btn_key):
+                        st.session_state[f"show_form_{item['url']}"] = not st.session_state.get(f"show_form_{item['url']}", False)
+                
+                # Show form if toggled
+                if st.session_state.get(f"show_form_{item['url']}", False):
+                    related_stocks = item.get('related_stocks', [])
+                    target_name, target_code = "", ""
+                    
+                    # Pre-fill logic
+                    if related_stocks:
+                        target_full = related_stocks[0] 
+                        match = re.match(r"(.*?)\((.*?)\)", target_full)
+                        if match:
+                            target_name, target_code = match.groups()
+                    
+                    # If not found by twstock, try intelligent extraction
+                    if not target_name:
+                        ext_name, ext_code = intelligent_extract_company(item['title'])
+                        target_name = ext_name
+                        target_code = ext_code
+
+                    st.write("---")
+                    st.write("確認公司資訊：")
+                    fc1, fc2 = st.columns(2)
+                    with fc1: target_name = st.text_input("公司名稱", value=target_name, key=f"n_in_{item['url']}")
+                    with fc2: target_code = st.text_input("股票代碼", value=target_code, key=f"c_in_{item['url']}")
+
+                    if target_name:
+                        # Actions
+                        if st.button(f"➕ 加入我的監控清單", key=f"mon_btn_{item['url']}"):
+                            if "監控清單" not in st.session_state.industry_map:
+                                st.session_state.industry_map["監控清單"] = []
+                            if (target_name, target_code) not in st.session_state.industry_map["監控清單"]:
+                                st.session_state.industry_map["監控清單"].append((target_name, target_code))
+                                save_industry_map(st.session_state.industry_map)
+                                st.toast(f"📺 已將 {target_name} 加入監控清單", icon="📡")
+                            st.session_state[f"show_form_{item['url']}"] = False
+                            st.rerun()
+
+                        tab_ex, tab_new = st.tabs(["加入現有產業", "建立新主題"])
+                        with tab_ex:
+                            current_inds = [ind for ind in st.session_state.industry_map.keys() if ind != "監控清單"]
+                            if current_inds:
+                                target_ind = st.selectbox("選擇目標產業", current_inds, key=f"sel_ind_{item['url']}")
+                                if st.button("確認加入產業", key=f"cf_add_{item['url']}"):
+                                    if (target_name, target_code) not in st.session_state.industry_map[target_ind]:
+                                        st.session_state.industry_map[target_ind].append((target_name, target_code))
+                                        save_industry_map(st.session_state.industry_map)
+                                        st.toast(f"✅ 已將 {target_name} 加入 {target_ind}！", icon="🚀")
+                                    st.session_state[f"show_form_{item['url']}"] = False
+                                    st.rerun()
+                        with tab_new:
+                            new_theme = st.text_input("新產業名稱", key=f"new_th_{item['url']}")
+                            if st.button("建立並加入", key=f"cf_new_{item['url']}"):
+                                if new_theme:
+                                    if new_theme not in st.session_state.industry_map:
+                                        st.session_state.industry_map[new_theme] = [(target_name, target_code)]
+                                        save_industry_map(st.session_state.industry_map)
+                                        st.toast(f"✨ 已建立新主題 {new_theme}", icon="🆕")
+                                    st.session_state[f"show_form_{item['url']}"] = False
+                                    st.rerun()
+            
+            st.markdown("<br>", unsafe_allow_html=True) # Spacer
+
+    # --- Pagination UI at bottom ---
+    if total_pages > 1:
+        st.divider()
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c1:
+            if st.session_state.page_number > 1:
+                if st.button("上頁"):
+                    st.session_state.page_number -= 1
+                    st.rerun()
+        with c2:
+            st.markdown(f"<div style='text-align: center'> 第 {st.session_state.page_number} / {total_pages} 頁 </div>", unsafe_allow_html=True)
+        with c3:
+            if st.session_state.page_number < total_pages:
+                if st.button("下頁"):
+                    st.session_state.page_number += 1
+                    st.rerun()
 
 if __name__ == "__main__":
     main()
