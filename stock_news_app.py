@@ -109,7 +109,6 @@ class MarketQuoteFetcher:
         self.symbols = {
             "^TWII": "台股大盤",
             "2330.TW": "台積電",
-            "2454.TW": "聯發科",
             "AAPL": "蘋果 (AAPL)",
             "NVDA": "輝達 (NVDA)"
         }
@@ -160,14 +159,13 @@ def main():
             ["時間由新到舊", "時間由舊到新"]
         )
         
-        st.markdown("---")
-        st.header("🌙 市場概況")
-        if st.button("今日市場概況回顧"):
-            st.session_state.show_summary = True
-            
-        st.header("📈 即時行情")
-        if st.button("🚀 顯示今日最新行情"):
+        if st.button("🚀 顯示今日最新概況"):
             st.session_state.show_quotes = True
+            
+        st.markdown("---")
+        st.header("🌙 法人數據")
+        if st.button("今日三大法人買賣超"):
+            st.session_state.show_summary = True
 
         st.markdown("---")
         st.info("資料來源: GNews, FinMind, Twstock, yfinance")
